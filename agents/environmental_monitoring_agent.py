@@ -1,12 +1,11 @@
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from langchain_ollama import OllamaLLM
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
-
-from models.data_models import ProductAlert
 import config
+from models.data_models import ProductAlert
 
 class EnvironmentalMonitoringAgent:
     def __init__(self, product_data, time_series_data, iot_data):
@@ -21,58 +20,68 @@ class EnvironmentalMonitoringAgent:
         self.product_data = product_data
         self.time_series_data = time_series_data
         self.iot_data = iot_data
-        self.llm = OllamaLLM(model=config.OLLAMA_MODEL)
         
-        # Initialize prompt template for LLM analysis
-        self.analysis_template = PromptTemplate(
-            input_variables=["product_info", "environmental_data", "deviations", "risk_assessment"],
-            template="""
-            Based on the following information about environmental conditions for a perishable product:
-            
-            Product Info:
-            {product_info}
-            
-            Environmental Data:
-            {environmental_data}
-            
-            Environmental Deviations:
-            {deviations}
-            
-            Risk Assessment:
-            {risk_assessment}
-            
-            Please provide:
-            1. An analysis of the current environmental conditions
-            2. How these conditions are affecting product quality and shelf-life
-            3. Recommendations for immediate corrective actions
-            4. Long-term strategies to improve environmental conditions
-            
-            Your response should be concise and actionable.
-            """
-        )
-        
-        self.analysis_chain = LLMChain(llm=self.llm, prompt=self.analysis_template)
-        
-        # Clean and convert data types
+        # Preprocess data
         self._preprocess_data()
+        
+        # LLM for analysis
+        try:
+            self.llm = OllamaLLM(model=config.OLLAMA_MODEL)  # Using the new model specified in config
+            
+            # Analysis prompt
+            self.analysis_prompt = PromptTemplate(
+                input_variables=["sku_id", "product_data", "iot_data", "environmental_metrics"],
+                template="""
+                Analyze the environmental conditions for product {sku_id}.
+                
+                Product data:
+                {product_data}
+                
+                IoT sensor data:
+                {iot_data}
+                
+                Environmental metrics:
+                {environmental_metrics}
+                
+                Provide a detailed analysis including:
+                1. Temperature compliance rate and deviations
+                2. Humidity conditions and impact on product quality
+                3. Quality degradation assessment
+                4. Recommended storage condition adjustments
+                5. Potential environmental risks and mitigation strategies
+                
+                Analysis:
+                """
+            )
+            
+            self.analysis_chain = LLMChain(llm=self.llm, prompt=self.analysis_prompt)
+        except Exception as e:
+            print(f"Warning: Could not initialize LLM for analysis: {e}")
+            self.llm = None
     
     def _preprocess_data(self):
         """
         Preprocess data to ensure proper types
         """
-        # Convert Critical_Humidity in product data (removing % sign and converting to float)
-        if 'Critical_Humidity' in self.product_data.columns:
-            self.product_data['Critical_Humidity'] = self.product_data['Critical_Humidity'].apply(
-                lambda x: float(str(x).replace('%', '')) / 100 if isinstance(x, str) else x
-            )
-        
-        # Ensure TEMP_HUMIDITY is numeric in IoT data
-        if 'TEMP_HUMIDITY' in self.iot_data.columns:
-            self.iot_data['TEMP_HUMIDITY'] = pd.to_numeric(self.iot_data['TEMP_HUMIDITY'], errors='coerce')
+        try:
+            # Convert 'TIMESTAMP' column to datetime if it exists
+            if 'TIMESTAMP' in self.iot_data.columns:
+                if self.iot_data['TIMESTAMP'].dtype == 'object':
+                    self.iot_data['TIMESTAMP'] = pd.to_datetime(self.iot_data['TIMESTAMP'], errors='coerce')
             
-        # Ensure numeric temperature deviation
-        if 'temp_deviation' in self.time_series_data.columns:
-            self.time_series_data['temp_deviation'] = pd.to_numeric(self.time_series_data['temp_deviation'], errors='coerce')
+            # Ensure numeric columns are properly typed
+            numeric_columns = ['TEMP_HUMIDITY', 'SHOCK_EVENTS']
+            for col in numeric_columns:
+                if col in self.iot_data.columns:
+                    self.iot_data[col] = pd.to_numeric(self.iot_data[col], errors='coerce')
+            
+            # Handle missing values
+            self.iot_data = self.iot_data.fillna({
+                'TEMP_HUMIDITY': self.iot_data['TEMP_HUMIDITY'].mean() if not self.iot_data.empty else 0,
+                'SHOCK_EVENTS': 0
+            })
+        except Exception as e:
+            print(f"Error preprocessing IoT data: {e}")
     
     def calculate_critical_alert_rate(self, sku_id=None):
         """
@@ -85,70 +94,46 @@ class EnvironmentalMonitoringAgent:
         Returns:
             Critical alert rate as a percentage
         """
-        ts_df = self.time_series_data.copy()
-        if sku_id:
-            ts_df = ts_df[ts_df['SKU_id'] == sku_id]
-        
-        if ts_df.empty:
-            return 0.0
-            
-        # Join with product data to get Critical_Humidity values
-        merged_df = pd.merge(
-            ts_df, 
-            self.product_data, 
-            left_on='SKU_id', 
-            right_on='SKU_ID'
-        )
-        
-        if merged_df.empty:
-            return 0.0
-        
-        # Join with IoT data to get humidity values
-        merged_df = pd.merge(
-            merged_df,
-            self.iot_data,
-            left_on='SKU_id',
-            right_on='SKU_ID',
-            how='left'
-        )
-        
-        if merged_df.empty or 'TEMP_HUMIDITY' not in merged_df.columns:
-            return 0.0
-        
-        # Get invalid rows for debugging
-        invalid_rows = merged_df[pd.isna(merged_df['Critical_Humidity']) | pd.isna(merged_df['TEMP_HUMIDITY'])].copy()
-        if not invalid_rows.empty:
-            print(f"Warning: Found {len(invalid_rows)} rows with invalid humidity data")
-        
-        # Filter out invalid rows
-        valid_df = merged_df.dropna(subset=['Critical_Humidity', 'TEMP_HUMIDITY']).copy()
-        if valid_df.empty:
-            return 0.0
-        
-        # Ensure numeric types
-        valid_df['Critical_Humidity'] = pd.to_numeric(valid_df['Critical_Humidity'], errors='coerce')
-        valid_df['TEMP_HUMIDITY'] = pd.to_numeric(valid_df['TEMP_HUMIDITY'], errors='coerce')
-        valid_df['temp_deviation'] = pd.to_numeric(valid_df['temp_deviation'], errors='coerce')
-        
-        # Apply filtering after handling missing values
-        temp_deviation_filter = abs(valid_df['temp_deviation']) > config.TEMP_DEVIATION_ALERT
-        
-        # Handle humidity comparison safely
-        humidity_filter = pd.Series(False, index=valid_df.index)  # Default to False
-        
         try:
-            # First ensure we have numeric values to compare
-            mask = pd.notna(valid_df['TEMP_HUMIDITY']) & pd.notna(valid_df['Critical_Humidity'])
-            if mask.any():
-                humidity_filter[mask] = valid_df.loc[mask, 'TEMP_HUMIDITY'] > valid_df.loc[mask, 'Critical_Humidity'] * 100
+            # Get relevant data
+            temp_data = self.time_series_data.copy()
+            humidity_data = self.iot_data.copy()
+            
+            if sku_id:
+                temp_data = temp_data[temp_data['SKU_id'] == sku_id]
+                humidity_data = humidity_data[humidity_data['SKU_ID'] == sku_id]
+            
+            if temp_data.empty or humidity_data.empty:
+                return 0.0
+            
+            # Get product info to determine critical humidity levels
+            if sku_id:
+                product_info = self.product_data[self.product_data['SKU_ID'] == sku_id]
+                if not product_info.empty and 'Critical_Humidity' in product_info.columns:
+                    critical_humidity = product_info['Critical_Humidity'].values[0]
+                else:
+                    critical_humidity = 80.0  # Default if not found
+            else:
+                critical_humidity = 80.0  # Default if no specific SKU
+            
+            # Count critical temperature deviations
+            critical_temp_count = len(temp_data[temp_data['temp_deviation'] > config.TEMP_DEVIATION_ALERT])
+            
+            # Count critical humidity deviations
+            critical_humidity_count = len(humidity_data[humidity_data['TEMP_HUMIDITY'] > critical_humidity])
+            
+            # Total number of records
+            total_records = len(temp_data) + len(humidity_data)
+            
+            # Calculate alert rate
+            if total_records > 0:
+                alert_rate = ((critical_temp_count + critical_humidity_count) / total_records) * 100
+                return round(alert_rate, 2)
+            else:
+                return 0.0
         except Exception as e:
-            print(f"Warning: Error in humidity comparison: {e}")
-        
-        # Count batches with critical deviations
-        critical_batches = valid_df[temp_deviation_filter | humidity_filter]
-        
-        critical_alert_rate = (len(critical_batches) / len(valid_df)) * 100 if len(valid_df) > 0 else 0.0
-        return critical_alert_rate
+            print(f"Error calculating critical alert rate: {e}")
+            return 0.0
     
     def calculate_temp_compliance_rate(self, sku_id=None):
         """
@@ -161,26 +146,34 @@ class EnvironmentalMonitoringAgent:
         Returns:
             Temperature compliance rate as a percentage
         """
-        ts_df = self.time_series_data
-        if sku_id:
-            ts_df = ts_df[ts_df['SKU_id'] == sku_id]
-        
-        if ts_df.empty:
-            return 100.0  # Default to 100% if no data
-        
-        # Ensure numeric type for temp_deviation
-        ts_df['temp_deviation'] = pd.to_numeric(ts_df['temp_deviation'], errors='coerce')
-        
-        # Filter out NaN values
-        valid_df = ts_df.dropna(subset=['temp_deviation'])
-        if valid_df.empty:
-            return 100.0
+        try:
+            # Get temperature deviation data
+            temp_data = self.time_series_data.copy()
             
-        # Count readings within compliance range
-        compliant_readings = valid_df[abs(valid_df['temp_deviation']) <= 0.5]
-        
-        compliance_rate = (len(compliant_readings) / len(valid_df)) * 100
-        return compliance_rate
+            if sku_id:
+                temp_data = temp_data[temp_data['SKU_id'] == sku_id]
+                
+                # Get ideal temperature from product data
+                product_info = self.product_data[self.product_data['SKU_ID'] == sku_id]
+                if not product_info.empty and 'Storage_Temp' in product_info.columns:
+                    ideal_temp = product_info['Storage_Temp'].values[0]
+                else:
+                    ideal_temp = 0.0  # Default
+            else:
+                ideal_temp = 0.0  # Default if no specific SKU
+            
+            if temp_data.empty:
+                return 0.0
+            
+            # Count compliant readings (within ±0.5°C)
+            compliant_count = len(temp_data[abs(temp_data['temp_deviation']) <= 0.5])
+            
+            # Calculate compliance rate
+            compliance_rate = (compliant_count / len(temp_data)) * 100
+            return round(compliance_rate, 2)
+        except Exception as e:
+            print(f"Error calculating temperature compliance rate: {e}")
+            return 0.0
     
     def calculate_quality_degradation_index(self, sku_id=None):
         """
@@ -193,25 +186,27 @@ class EnvironmentalMonitoringAgent:
         Returns:
             Quality Degradation Index as a float
         """
-        ts_df = self.time_series_data
-        if sku_id:
-            ts_df = ts_df[ts_df['SKU_id'] == sku_id]
-        
-        if ts_df.empty:
-            return 0.0
-        
-        # Ensure numeric type for temp_deviation
-        ts_df['temp_deviation'] = pd.to_numeric(ts_df['temp_deviation'], errors='coerce')
-        
-        # Filter out NaN values
-        valid_df = ts_df.dropna(subset=['temp_deviation'])
-        if valid_df.empty:
-            return 0.0
+        try:
+            # Get temperature deviation data
+            temp_data = self.time_series_data.copy()
             
-        # Assume each reading represents 1 time unit (e.g., 1 hour)
-        # Sum of absolute temperature deviations × time
-        degradation_index = (abs(valid_df['temp_deviation']) * 1).sum()
-        return degradation_index
+            if sku_id:
+                temp_data = temp_data[temp_data['SKU_id'] == sku_id]
+            
+            if temp_data.empty:
+                return 0.0
+            
+            # Calculate quality degradation
+            # Assume 1 unit of time per reading for simplicity
+            time_factor = 1.0
+            
+            # Sum of absolute temperature deviations × time
+            degradation_index = sum(abs(temp_data['temp_deviation']) * time_factor)
+            
+            return round(degradation_index, 2)
+        except Exception as e:
+            print(f"Error calculating quality degradation index: {e}")
+            return 0.0
     
     def calculate_shelf_life_decay(self, sku_id):
         """
@@ -224,56 +219,48 @@ class EnvironmentalMonitoringAgent:
         Returns:
             Dictionary with original and adjusted shelf life
         """
-        # Get product data
-        product_df = self.product_data[self.product_data['SKU_ID'] == sku_id]
-        if product_df.empty:
-            return {"original": 0, "adjusted": 0, "adjustment_factor": 1.0}
-        
-        # Convert Initial_Shelf_Life to float if needed
-        initial_shelf_life = product_df.iloc[0].get('Initial_Shelf_Life')
-        if initial_shelf_life is None:
-            initial_shelf_life = product_df.iloc[0].get('initial_shelf_life', 0)
-        
         try:
-            initial_shelf_life = float(initial_shelf_life)
-        except (ValueError, TypeError):
-            print(f"Warning: Invalid shelf life for SKU {sku_id}: {initial_shelf_life}")
-            initial_shelf_life = 0
+            # Get product data
+            product_info = self.product_data[self.product_data['SKU_ID'] == sku_id]
             
-        # Get time series data
-        ts_df = self.time_series_data[self.time_series_data['SKU_id'] == sku_id]
-        if ts_df.empty:
-            return {"original": initial_shelf_life, "adjusted": initial_shelf_life, "adjustment_factor": 1.0}
+            if product_info.empty or 'Initial_Shelf_Life' not in product_info.columns:
+                return {"original": 0, "adjusted": 0}
             
-        # Get IoT data
-        iot_df = self.iot_data[self.iot_data['SKU_ID'] == sku_id]
-        if iot_df.empty:
-            return {"original": initial_shelf_life, "adjusted": initial_shelf_life, "adjustment_factor": 1.0}
-        
-        # Ensure numeric type for temp_deviation
-        ts_df['temp_deviation'] = pd.to_numeric(ts_df['temp_deviation'], errors='coerce')
+            # Get initial shelf life
+            initial_shelf_life = product_info['Initial_Shelf_Life'].values[0]
             
-        # Calculate average temperature deviation
-        avg_temp_deviation = abs(ts_df['temp_deviation'].mean())
-        
-        # Calculate humidity change (using standard humidity as 70%)
-        if 'TEMP_HUMIDITY' in iot_df.columns:
-            # Ensure numeric type
-            iot_df['TEMP_HUMIDITY'] = pd.to_numeric(iot_df['TEMP_HUMIDITY'], errors='coerce')
-            avg_humidity = iot_df['TEMP_HUMIDITY'].mean()
-            humidity_change = abs(avg_humidity - 70) / 100  # Convert to decimal
-        else:
-            humidity_change = 0.0
-        
-        # Calculate adjusted shelf life
-        adjustment_factor = 1 - (0.05 * avg_temp_deviation) + (0.03 * humidity_change)
-        adjusted_shelf_life = initial_shelf_life * adjustment_factor
-        
-        return {
-            "original": initial_shelf_life,
-            "adjusted": adjusted_shelf_life,
-            "adjustment_factor": adjustment_factor
-        }
+            # Get temperature deviation data
+            temp_data = self.time_series_data[self.time_series_data['SKU_id'] == sku_id]
+            
+            # Get humidity data
+            humidity_data = self.iot_data[self.iot_data['SKU_ID'] == sku_id]
+            
+            if temp_data.empty or humidity_data.empty:
+                return {"original": initial_shelf_life, "adjusted": initial_shelf_life}
+            
+            # Calculate average temperature deviation
+            avg_temp_deviation = abs(temp_data['temp_deviation'].mean())
+            
+            # Calculate humidity change
+            # For simplicity, compare current humidity with critical humidity
+            critical_humidity = product_info['Critical_Humidity'].values[0] if 'Critical_Humidity' in product_info.columns else 70.0
+            current_humidity = humidity_data['TEMP_HUMIDITY'].mean()
+            humidity_change = abs(current_humidity - critical_humidity) / 100.0  # Normalize to 0-1 range
+            
+            # Calculate adjusted shelf life
+            temp_factor = 0.05 * avg_temp_deviation
+            humidity_factor = 0.03 * humidity_change
+            
+            adjustment_factor = 1 - temp_factor + humidity_factor
+            adjusted_shelf_life = initial_shelf_life * adjustment_factor
+            
+            return {
+                "original": initial_shelf_life,
+                "adjusted": round(adjusted_shelf_life, 1)
+            }
+        except Exception as e:
+            print(f"Error calculating shelf life decay: {e}")
+            return {"original": 0, "adjusted": 0}
     
     def identify_environmental_issues(self):
         """
@@ -282,111 +269,66 @@ class EnvironmentalMonitoringAgent:
         Returns:
             DataFrame with environmental issues
         """
-        results = []
-        
-        # Get unique SKUs
-        unique_skus = self.time_series_data['SKU_id'].unique()
-        
-        for sku_id in unique_skus:
-            try:
-                # Get product data
-                product_df = self.product_data[self.product_data['SKU_ID'] == sku_id]
-                if product_df.empty:
-                    continue
-                    
-                product = product_df.iloc[0].to_dict()
-                
-                # Get time series data
-                ts_df = self.time_series_data[self.time_series_data['SKU_id'] == sku_id]
-                if ts_df.empty:
-                    continue
-                    
-                # Get IoT data
-                iot_df = self.iot_data[self.iot_data['SKU_ID'] == sku_id]
-                if iot_df.empty:
-                    continue
-                
-                # Ensure data types are correct
-                ts_df['temp_deviation'] = pd.to_numeric(ts_df['temp_deviation'], errors='coerce')
-                
-                if 'TEMP_HUMIDITY' in iot_df.columns:
-                    iot_df['TEMP_HUMIDITY'] = pd.to_numeric(iot_df['TEMP_HUMIDITY'], errors='coerce')
-                
-                if 'Critical_Humidity' in product:
-                    try:
-                        product['Critical_Humidity'] = float(str(product['Critical_Humidity']).replace('%', '')) / 100 if isinstance(product['Critical_Humidity'], str) else product['Critical_Humidity']
-                    except (ValueError, TypeError):
-                        product['Critical_Humidity'] = 0.7  # Default value
-                    
+        try:
+            # Initialize empty list to store issues
+            issues = []
+            
+            # Get unique SKUs
+            unique_skus = self.product_data['SKU_ID'].unique()
+            
+            for sku_id in unique_skus:
                 # Calculate metrics
                 critical_alert_rate = self.calculate_critical_alert_rate(sku_id)
                 temp_compliance_rate = self.calculate_temp_compliance_rate(sku_id)
-                quality_degradation_index = self.calculate_quality_degradation_index(sku_id)
-                shelf_life_decay = self.calculate_shelf_life_decay(sku_id)
+                quality_degradation = self.calculate_quality_degradation_index(sku_id)
+                shelf_life_info = self.calculate_shelf_life_decay(sku_id)
                 
-                # Check for environmental issues
-                has_issues = False
-                issues = []
+                # Get SKU data
+                sku_temp_data = self.time_series_data[self.time_series_data['SKU_id'] == sku_id]
+                sku_humidity_data = self.iot_data[self.iot_data['SKU_ID'] == sku_id]
                 
-                # Check temperature deviation
-                avg_temp_deviation = abs(ts_df['temp_deviation'].mean())
-                if avg_temp_deviation > config.TEMP_DEVIATION_ALERT:
-                    has_issues = True
-                    issues.append(f"High temperature deviation: {avg_temp_deviation:.2f}°C")
+                # Get warehouses for this SKU
+                warehouses = sku_temp_data['warehous_id'].unique() if not sku_temp_data.empty else []
+                
+                # For each warehouse, check if there are environmental issues
+                for warehouse_id in warehouses:
+                    # Filter data by warehouse
+                    warehouse_temp_data = sku_temp_data[sku_temp_data['warehous_id'] == warehouse_id]
                     
-                # Check humidity
-                if 'TEMP_HUMIDITY' in iot_df.columns and 'Critical_Humidity' in product:
-                    avg_humidity = iot_df['TEMP_HUMIDITY'].mean()
-                    critical_humidity = product['Critical_Humidity'] * 100  # Convert to percentage
+                    if warehouse_temp_data.empty:
+                        continue
                     
-                    if not pd.isna(avg_humidity) and not pd.isna(critical_humidity) and avg_humidity > critical_humidity:
-                        has_issues = True
-                        issues.append(f"High humidity: {avg_humidity:.2f}% (Critical: {critical_humidity:.2f}%)")
+                    # Get max temperature deviation for this warehouse
+                    max_temp_deviation = warehouse_temp_data['temp_deviation'].max()
                     
-                # Check critical alert rate
-                if critical_alert_rate > 20.0:  # 20% threshold
-                    has_issues = True
-                    issues.append(f"High critical alert rate: {critical_alert_rate:.2f}%")
+                    # Calculate shelf life reduction percentage
+                    shelf_life_reduction = ((shelf_life_info['original'] - shelf_life_info['adjusted']) / 
+                                           shelf_life_info['original'] * 100) if shelf_life_info['original'] > 0 else 0
                     
-                # Check temperature compliance rate
-                if temp_compliance_rate < 80.0:  # 80% threshold
-                    has_issues = True
-                    issues.append(f"Low temperature compliance rate: {temp_compliance_rate:.2f}%")
+                    # Check for issues
+                    has_issues = (
+                        critical_alert_rate > 10.0 or
+                        temp_compliance_rate < 80.0 or
+                        quality_degradation > 5.0 or
+                        shelf_life_reduction > 10.0 or
+                        abs(max_temp_deviation) > config.TEMP_DEVIATION_ALERT
+                    )
                     
-                # Check quality degradation
-                if quality_degradation_index > 10.0:  # Arbitrary threshold
-                    has_issues = True
-                    issues.append(f"High quality degradation index: {quality_degradation_index:.2f}")
-                    
-                # Check shelf life adjustment
-                if shelf_life_decay["adjustment_factor"] < 0.8:  # 20% reduction threshold
-                    has_issues = True
-                    reduction = (1 - shelf_life_decay["adjustment_factor"]) * 100
-                    issues.append(f"Significant shelf life reduction: {reduction:.2f}%")
-                    
-                if has_issues:
-                    for warehouse_id in ts_df['warehous_id'].unique():
-                        warehouse_ts = ts_df[ts_df['warehous_id'] == warehouse_id]
-                        if warehouse_ts.empty:
-                            continue
-                            
-                        results.append({
+                    if has_issues:
+                        issues.append({
                             'SKU_ID': sku_id,
                             'warehouse_id': warehouse_id,
-                            'product_category': product.get('Product_Category', 'Unknown'),
                             'critical_alert_rate': critical_alert_rate,
                             'temp_compliance_rate': temp_compliance_rate,
-                            'quality_degradation_index': quality_degradation_index,
-                            'original_shelf_life': shelf_life_decay["original"],
-                            'adjusted_shelf_life': shelf_life_decay["adjusted"],
-                            'shelf_life_reduction': (1 - shelf_life_decay["adjustment_factor"]) * 100,
-                            'issues': ', '.join(issues)
+                            'quality_degradation': quality_degradation,
+                            'max_temp_deviation': max_temp_deviation,
+                            'shelf_life_reduction': shelf_life_reduction
                         })
-            except Exception as e:
-                print(f"Error processing SKU {sku_id}: {e}")
-                continue
-                
-        return pd.DataFrame(results) if results else pd.DataFrame()
+            
+            return pd.DataFrame(issues)
+        except Exception as e:
+            print(f"Error identifying environmental issues: {e}")
+            return pd.DataFrame()
     
     def generate_alerts(self):
         """
@@ -396,47 +338,59 @@ class EnvironmentalMonitoringAgent:
             List of ProductAlert objects
         """
         try:
-            environmental_issues = self.identify_environmental_issues()
-            alerts = []
+            # Get environmental issues
+            issues = self.identify_environmental_issues()
             
-            if environmental_issues.empty:
-                print("No environmental issues found")
+            if issues.empty:
                 return []
             
-            for _, issue in environmental_issues.iterrows():
-                try:
-                    # Determine alert severity
+            # Initialize list to store alerts
+            alerts = []
+            
+            for _, issue in issues.iterrows():
+                # Determine alert type and severity
+                if issue['max_temp_deviation'] > config.TEMP_DEVIATION_ALERT:
+                    alert_type = "TEMPERATURE"
+                    severity = "HIGH" if abs(issue['max_temp_deviation']) > 5.0 else "MEDIUM"
+                    message = f"Temperature deviation of {issue['max_temp_deviation']:.1f}°C detected."
+                    action = "Adjust storage temperature settings and verify refrigeration equipment."
+                elif issue['shelf_life_reduction'] > 10.0:
+                    alert_type = "SHELF_LIFE"
+                    severity = "HIGH" if issue['shelf_life_reduction'] > 20.0 else "MEDIUM"
+                    message = f"Environmental conditions reducing shelf life by {issue['shelf_life_reduction']:.1f}%."
+                    action = "Review storage conditions and reduce temperature fluctuations."
+                elif issue['temp_compliance_rate'] < 80.0:
+                    alert_type = "COMPLIANCE"
+                    severity = "MEDIUM"
+                    message = f"Temperature compliance rate is low at {issue['temp_compliance_rate']:.1f}%."
+                    action = "Check temperature control systems and calibrate sensors."
+                elif issue['quality_degradation'] > 5.0:
+                    alert_type = "QUALITY"
+                    severity = "MEDIUM"
+                    message = f"Quality degradation index is elevated at {issue['quality_degradation']:.1f}."
+                    action = "Implement more frequent quality checks and improve environmental stability."
+                else:
+                    alert_type = "GENERAL"
                     severity = "LOW"
-                    if issue['critical_alert_rate'] > 50.0 or issue['shelf_life_reduction'] > 30.0:
-                        severity = "HIGH"
-                    elif issue['critical_alert_rate'] > 20.0 or issue['shelf_life_reduction'] > 15.0:
-                        severity = "MEDIUM"
-                        
-                    # Determine recommended action
-                    if severity == "HIGH":
-                        recommended_action = "Immediate relocation to compliant storage or markdown for quick sale"
-                    elif severity == "MEDIUM":
-                        recommended_action = "Adjust storage conditions and monitor closely"
-                    else:
-                        recommended_action = "Monitor and maintain storage conditions"
-                        
-                    alert = ProductAlert(
-                        SKU_ID=issue['SKU_ID'],
-                        warehouse_id=issue['warehouse_id'],
-                        alert_type="ENVIRONMENTAL_RISK",
-                        severity=severity,
-                        message=issue['issues'],
-                        timestamp=datetime.now(),
-                        recommended_action=recommended_action
-                    )
-                    alerts.append(alert)
-                except Exception as e:
-                    print(f"Error generating alert for issue: {e}")
-                    continue
+                    message = "Potential environmental optimization opportunity."
+                    action = "Monitor environmental conditions and adjust as needed."
                 
+                # Create alert
+                alert = ProductAlert(
+                    SKU_ID=issue['SKU_ID'],
+                    warehouse_id=issue['warehouse_id'],
+                    alert_type=alert_type,
+                    severity=severity,
+                    message=message,
+                    timestamp=datetime.now(),
+                    recommended_action=action
+                )
+                
+                alerts.append(alert)
+            
             return alerts
         except Exception as e:
-            print(f"Error in generate_alerts: {e}")
+            print(f"Error generating environmental alerts: {e}")
             return []
     
     def get_environmental_analysis(self, sku_id, warehouse_id=None):
@@ -451,71 +405,38 @@ class EnvironmentalMonitoringAgent:
             Analysis text from the LLM
         """
         try:
-            # Get product info
+            if not self.llm:
+                return "LLM analysis is not available."
+            
+            # Get product data
             product_info = self.product_data[self.product_data['SKU_ID'] == sku_id]
             if product_info.empty:
-                return "Product not found."
+                return f"No product information found for SKU {sku_id}."
             
-            product_info = product_info.iloc[0].to_dict()
+            # Get IoT data
+            iot_data = self.iot_data[self.iot_data['SKU_ID'] == sku_id]
+            if iot_data.empty:
+                return f"No IoT sensor data found for SKU {sku_id}."
             
-            # Get environmental data
-            ts_df = self.time_series_data[self.time_series_data['SKU_id'] == sku_id]
-            if warehouse_id:
-                ts_df = ts_df[ts_df['warehous_id'] == warehouse_id]
-            
-            if ts_df.empty:
-                return "Environmental data not found."
-                
-            iot_df = self.iot_data[self.iot_data['SKU_ID'] == sku_id]
-            
-            if iot_df.empty:
-                return "IoT data not found."
-            
-            # Ensure numeric types
-            ts_df['temp_deviation'] = pd.to_numeric(ts_df['temp_deviation'], errors='coerce')
-            if 'TEMP_HUMIDITY' in iot_df.columns:
-                iot_df['TEMP_HUMIDITY'] = pd.to_numeric(iot_df['TEMP_HUMIDITY'], errors='coerce')
-            
-            environmental_data = {}
-            environmental_data["avg_temp_deviation"] = ts_df['temp_deviation'].mean()
-            environmental_data["max_temp_deviation"] = ts_df['temp_deviation'].max()
-            
-            if 'TEMP_HUMIDITY' in iot_df.columns:
-                environmental_data["avg_humidity"] = iot_df['TEMP_HUMIDITY'].mean()
-            else:
-                environmental_data["avg_humidity"] = "Data not available"
-                
-            if 'SHOCK_EVENTS' in iot_df.columns:
-                environmental_data["shock_events"] = iot_df['SHOCK_EVENTS'].sum()
-            else:
-                environmental_data["shock_events"] = "Data not available"
-            
-            # Calculate deviations
-            deviations = {
-                "critical_alert_rate": self.calculate_critical_alert_rate(sku_id),
-                "temp_compliance_rate": self.calculate_temp_compliance_rate(sku_id),
-                "quality_degradation_index": self.calculate_quality_degradation_index(sku_id)
+            # Calculate metrics
+            metrics = {
+                'critical_alert_rate': self.calculate_critical_alert_rate(sku_id),
+                'temp_compliance_rate': self.calculate_temp_compliance_rate(sku_id),
+                'quality_degradation': self.calculate_quality_degradation_index(sku_id),
+                'shelf_life_decay': self.calculate_shelf_life_decay(sku_id)
             }
             
-            # Calculate risk assessment
-            shelf_life_decay = self.calculate_shelf_life_decay(sku_id)
-            shelf_life_reduction = (1 - shelf_life_decay["adjustment_factor"]) * 100
+            # Format metrics as string
+            metrics_str = "\n".join([f"{k}: {v}" for k, v in metrics.items()])
             
-            risk_assessment = {
-                "original_shelf_life": shelf_life_decay["original"],
-                "adjusted_shelf_life": shelf_life_decay["adjusted"],
-                "shelf_life_reduction_percentage": shelf_life_reduction,
-                "risk_level": "HIGH" if shelf_life_reduction > 30.0 else "MEDIUM" if shelf_life_reduction > 15.0 else "LOW"
-            }
-            
-            # Get analysis from LLM
-            analysis = self.analysis_chain.run(
-                product_info=str(product_info),
-                environmental_data=str(environmental_data),
-                deviations=str(deviations),
-                risk_assessment=str(risk_assessment)
+            # Run analysis
+            result = self.analysis_chain.run(
+                sku_id=sku_id,
+                product_data=product_info.to_string(),
+                iot_data=iot_data.to_string(),
+                environmental_metrics=metrics_str
             )
             
-            return analysis
+            return result
         except Exception as e:
             return f"Error generating environmental analysis: {e}"

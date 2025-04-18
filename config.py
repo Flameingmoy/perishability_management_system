@@ -9,7 +9,8 @@ SUPPLIER_DATA_FILE = "/home/chinmay/Desktop/vaspp/data/supplier_data.csv"
 SALES_DATA_FILE = "/home/chinmay/Desktop/vaspp/data/sales_data.csv"
 
 # Ollama model configuration
-OLLAMA_MODEL = "gemma3:27b"  
+OLLAMA_MODEL = "granite3.3:8b"  
+OLLAMA_EMBEDDING_MODEL = "snowflake-arctic-embed2:latest"  
 
 # Alert thresholds
 EXPIRY_ALERT_THRESHOLD = 3  # Days

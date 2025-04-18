@@ -1,15 +1,11 @@
-import warnings
-warnings.filterwarnings("ignore")
-
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from langchain_ollama import OllamaLLM
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
-
-from models.data_models import ProductAlert
 import config
+from models.data_models import ProductAlert
 
 class InventoryMonitoringAgent:
     def __init__(self, product_data, time_series_data):
@@ -22,36 +18,38 @@ class InventoryMonitoringAgent:
         """
         self.product_data = product_data
         self.time_series_data = time_series_data
-        self.llm = OllamaLLM(model=config.OLLAMA_MODEL)
         
-        # Initialize prompt template for LLM analysis
-        self.analysis_template = PromptTemplate(
-            input_variables=["product_info", "inventory_status", "metrics", "alerts"],
-            template="""
-            Based on the following information about a perishable product:
+        # LLM for analysis
+        try:
+            self.llm = OllamaLLM(model=config.OLLAMA_MODEL)  # Using the new model specified in config
             
-            Product Info:
-            {product_info}
+            # Analysis prompt
+            self.analysis_prompt = PromptTemplate(
+                input_variables=["sku_id", "warehouse_id", "inventory_data", "product_data"],
+                template="""
+                Analyze the inventory situation for product {sku_id} in warehouse {warehouse_id}.
+                
+                Product data:
+                {product_data}
+                
+                Inventory data:
+                {inventory_data}
+                
+                Provide a detailed analysis including:
+                1. Current stock level and shelf-life remaining
+                2. Waste percentage and implications
+                3. Shelf-life utilization rate
+                4. Recommendations for inventory management
+                5. Potential risks and mitigation strategies
+                
+                Analysis:
+                """
+            )
             
-            Current Inventory Status:
-            {inventory_status}
-            
-            Key Metrics:
-            {metrics}
-            
-            Current Alerts:
-            {alerts}
-            
-            Please provide:
-            1. An analysis of the current inventory situation
-            2. Recommendations for immediate actions to reduce waste
-            3. Suggestions for optimal inventory management
-            
-            Your response should be concise and actionable.
-            """
-        )
-        
-        self.analysis_chain = LLMChain(llm=self.llm, prompt=self.analysis_template)
+            self.analysis_chain = LLMChain(llm=self.llm, prompt=self.analysis_prompt)
+        except Exception as e:
+            print(f"Warning: Could not initialize LLM for analysis: {e}")
+            self.llm = None
     
     def calculate_waste_percentage(self, sku_id, warehouse_id=None):
         """
@@ -65,23 +63,28 @@ class InventoryMonitoringAgent:
         Returns:
             Waste percentage as a float
         """
-        df = self.time_series_data
-        if warehouse_id:
-            df = df[df['warehous_id'] == warehouse_id]
-        
-        df = df[df['SKU_id'] == sku_id]
-        
-        if df.empty:
-            return 0.0
+        try:
+            # Filter data by SKU and warehouse
+            filtered_data = self.time_series_data[self.time_series_data['SKU_id'] == sku_id]
+            if warehouse_id:
+                filtered_data = filtered_data[filtered_data['warehous_id'] == warehouse_id]
             
-        total_waste = df['waste_qty'].sum()
-        total_current_stock = df['current_stock'].sum()
-        
-        if total_waste + total_current_stock == 0:
-            return 0.0
+            if filtered_data.empty:
+                return 0.0
             
-        waste_percentage = (total_waste / (total_current_stock + total_waste)) * 100
-        return waste_percentage
+            # Sum waste quantity and current stock
+            total_waste = filtered_data['waste_qty'].sum()
+            total_stock = filtered_data['current_stock'].sum()
+            
+            # Calculate waste percentage
+            if total_stock + total_waste > 0:
+                waste_percentage = (total_waste / (total_stock + total_waste)) * 100
+                return round(waste_percentage, 2)
+            else:
+                return 0.0
+        except Exception as e:
+            print(f"Error calculating waste percentage: {e}")
+            return 0.0
     
     def calculate_shelf_life_utilization(self, sku_id, warehouse_id=None):
         """
@@ -95,25 +98,34 @@ class InventoryMonitoringAgent:
         Returns:
             Shelf-life utilization as a float (between 0 and 1)
         """
-        ts_df = self.time_series_data
-        if warehouse_id:
-            ts_df = ts_df[ts_df['warehous_id'] == warehouse_id]
-        
-        ts_df = ts_df[ts_df['SKU_id'] == sku_id]
-        
-        if ts_df.empty:
+        try:
+            # Get initial shelf life from product data
+            product_info = self.product_data[self.product_data['SKU_ID'] == sku_id]
+            if product_info.empty:
+                return 0.0
+            
+            initial_shelf_life = product_info['Initial_Shelf_Life'].values[0]
+            
+            # Filter time series data
+            filtered_data = self.time_series_data[self.time_series_data['SKU_id'] == sku_id]
+            if warehouse_id:
+                filtered_data = filtered_data[filtered_data['warehous_id'] == warehouse_id]
+            
+            if filtered_data.empty:
+                return 0.0
+            
+            # Calculate average days remaining
+            avg_days_remaining = filtered_data['days_remaining'].mean()
+            
+            # Calculate utilization
+            if initial_shelf_life > 0:
+                utilization = (initial_shelf_life - avg_days_remaining) / initial_shelf_life
+                return min(1.0, max(0.0, utilization))  # Ensure value is between 0 and 1
+            else:
+                return 0.0
+        except Exception as e:
+            print(f"Error calculating shelf-life utilization: {e}")
             return 0.0
-        
-        product_df = self.product_data[self.product_data['SKU_ID'] == sku_id]
-        
-        if product_df.empty:
-            return 0.0
-        
-        initial_shelf_life = product_df.iloc[0]['Initial_Shelf_Life']
-        days_remaining = ts_df.iloc[0]['days_remaining']
-        
-        utilization = (initial_shelf_life - days_remaining) / initial_shelf_life
-        return max(0.0, min(1.0, utilization))  # Ensure result is between 0 and 1
     
     def identify_critical_inventory(self):
         """
@@ -122,67 +134,50 @@ class InventoryMonitoringAgent:
         Returns:
             DataFrame containing critical inventory items
         """
-        results = []
-        
-        # Get unique SKU and warehouse combinations
-        unique_combinations = self.time_series_data[['SKU_id', 'warehous_id']].drop_duplicates()
-        
-        for _, row in unique_combinations.iterrows():
-            sku_id = row['SKU_id']
-            warehouse_id = row['warehous_id']
+        try:
+            # Initialize empty list to store critical items
+            critical_items = []
             
-            # Get time series data for this SKU and warehouse
-            ts_df = self.time_series_data[
-                (self.time_series_data['SKU_id'] == sku_id) & 
-                (self.time_series_data['warehous_id'] == warehouse_id)
-            ]
+            # Get unique combinations of SKU_id and warehouse_id
+            unique_combinations = self.time_series_data[['SKU_id', 'warehous_id']].drop_duplicates()
             
-            if ts_df.empty:
-                continue
+            for _, row in unique_combinations.iterrows():
+                sku_id = row['SKU_id']
+                warehouse_id = row['warehous_id']
                 
-            # Get latest record
-            latest = ts_df.iloc[0]
+                # Calculate metrics
+                waste_percentage = self.calculate_waste_percentage(sku_id, warehouse_id)
+                shelf_life_utilization = self.calculate_shelf_life_utilization(sku_id, warehouse_id)
+                
+                # Get days remaining
+                filtered_data = self.time_series_data[
+                    (self.time_series_data['SKU_id'] == sku_id) & 
+                    (self.time_series_data['warehous_id'] == warehouse_id)
+                ]
+                days_remaining = filtered_data['days_remaining'].mean() if not filtered_data.empty else 0
+                current_stock = filtered_data['current_stock'].sum() if not filtered_data.empty else 0
+                
+                # Determine if item is critical
+                is_critical = (
+                    days_remaining <= config.EXPIRY_ALERT_THRESHOLD or
+                    waste_percentage >= config.WASTE_PERCENTAGE_ALERT or
+                    shelf_life_utilization >= config.SHELF_LIFE_UTILIZATION_ALERT
+                )
+                
+                if is_critical:
+                    critical_items.append({
+                        'SKU_ID': sku_id,
+                        'warehouse_id': warehouse_id,
+                        'days_remaining': days_remaining,
+                        'current_stock': current_stock,
+                        'waste_percentage': waste_percentage,
+                        'shelf_life_utilization': shelf_life_utilization
+                    })
             
-            # Get product data
-            product_data = self.product_data[self.product_data['SKU_ID'] == sku_id]
-            if product_data.empty:
-                continue
-                
-            product = product_data.iloc[0]
-            
-            # Calculate metrics
-            waste_percentage = self.calculate_waste_percentage(sku_id, warehouse_id)
-            shelf_life_utilization = self.calculate_shelf_life_utilization(sku_id, warehouse_id)
-            
-            # Check if this is critical inventory
-            is_critical = False
-            reasons = []
-            
-            if latest['days_remaining'] <= config.EXPIRY_ALERT_THRESHOLD:
-                is_critical = True
-                reasons.append(f"Only {latest['days_remaining']} days remaining until expiry")
-                
-            if waste_percentage >= config.WASTE_PERCENTAGE_ALERT:
-                is_critical = True
-                reasons.append(f"High waste percentage: {waste_percentage:.2f}%")
-                
-            if shelf_life_utilization >= config.SHELF_LIFE_UTILIZATION_ALERT:
-                is_critical = True
-                reasons.append(f"High shelf life utilization: {shelf_life_utilization:.2f}")
-                
-            if is_critical:
-                results.append({
-                    'SKU_ID': sku_id,
-                    'warehous_id': warehouse_id,
-                    'current_stock': latest['current_stock'],
-                    'unit': latest['unit_curr_stock'],
-                    'days_remaining': latest['days_remaining'],
-                    'waste_percentage': waste_percentage,
-                    'shelf_life_utilization': shelf_life_utilization,
-                    'reasons': ', '.join(reasons)
-                })
-                
-        return pd.DataFrame(results)
+            return pd.DataFrame(critical_items)
+        except Exception as e:
+            print(f"Error identifying critical inventory: {e}")
+            return pd.DataFrame()
     
     def generate_alerts(self):
         """
@@ -191,38 +186,56 @@ class InventoryMonitoringAgent:
         Returns:
             List of ProductAlert objects
         """
-        critical_inventory = self.identify_critical_inventory()
-        alerts = []
-        
-        for _, item in critical_inventory.iterrows():
-            # Determine alert severity based on days remaining
-            severity = "LOW"
-            if item['days_remaining'] <= 1:
-                severity = "HIGH"
-            elif item['days_remaining'] <= 3:
-                severity = "MEDIUM"
-                
-            # Determine recommended action
-            recommended_action = ""
-            if item['days_remaining'] <= 1:
-                recommended_action = "Immediate markdown or transfer to high-demand location"
-            elif item['days_remaining'] <= 3:
-                recommended_action = "Apply discount to accelerate sales"
-            else:
-                recommended_action = "Monitor closely"
-                
-            alert = ProductAlert(
-                SKU_ID=item['SKU_ID'],
-                warehouse_id=item['warehous_id'],
-                alert_type="EXPIRY_RISK",
-                severity=severity,
-                message=item['reasons'],
-                timestamp=datetime.now(),
-                recommended_action=recommended_action
-            )
-            alerts.append(alert)
+        try:
+            # Get critical inventory
+            critical_inventory = self.identify_critical_inventory()
             
-        return alerts
+            if critical_inventory.empty:
+                return []
+            
+            # Initialize list to store alerts
+            alerts = []
+            
+            for _, item in critical_inventory.iterrows():
+                # Determine alert type and severity
+                if item['days_remaining'] <= config.EXPIRY_ALERT_THRESHOLD:
+                    alert_type = "EXPIRY"
+                    severity = "HIGH" if item['days_remaining'] <= 1 else "MEDIUM"
+                    message = f"Product is nearing expiry with only {item['days_remaining']:.1f} days remaining."
+                    action = "Consider immediate price reduction or redistribution to high-demand locations."
+                elif item['waste_percentage'] >= config.WASTE_PERCENTAGE_ALERT:
+                    alert_type = "WASTE"
+                    severity = "HIGH" if item['waste_percentage'] >= 20 else "MEDIUM"
+                    message = f"High waste percentage detected: {item['waste_percentage']:.1f}%."
+                    action = "Review storage conditions and handling procedures. Consider adjusting order quantities."
+                elif item['shelf_life_utilization'] >= config.SHELF_LIFE_UTILIZATION_ALERT:
+                    alert_type = "SHELF_LIFE"
+                    severity = "MEDIUM"
+                    message = f"Product has used {item['shelf_life_utilization'] * 100:.1f}% of its shelf life."
+                    action = "Monitor closely and consider promotional pricing to increase turnover."
+                else:
+                    alert_type = "GENERAL"
+                    severity = "LOW"
+                    message = "Potential inventory optimization opportunity."
+                    action = "Review inventory levels against forecasted demand."
+                
+                # Create alert
+                alert = ProductAlert(
+                    SKU_ID=item['SKU_ID'],
+                    warehouse_id=item['warehouse_id'],
+                    alert_type=alert_type,
+                    severity=severity,
+                    message=message,
+                    timestamp=datetime.now(),
+                    recommended_action=action
+                )
+                
+                alerts.append(alert)
+            
+            return alerts
+        except Exception as e:
+            print(f"Error generating alerts: {e}")
+            return []
     
     def get_inventory_analysis(self, sku_id, warehouse_id):
         """
@@ -235,51 +248,40 @@ class InventoryMonitoringAgent:
         Returns:
             Analysis text from the LLM
         """
-        # Get product info
-        product_info = self.product_data[self.product_data['SKU_ID'] == sku_id]
-        if product_info.empty:
-            return "Product not found."
-        
-        product_info = product_info.iloc[0].to_dict()
-        
-        # Get inventory status
-        inventory_status = self.time_series_data[
-            (self.time_series_data['SKU_id'] == sku_id) & 
-            (self.time_series_data['warehous_id'] == warehouse_id)
-        ]
-        
-        if inventory_status.empty:
-            return "Inventory data not found."
+        try:
+            if not self.llm:
+                return "LLM analysis is not available."
             
-        inventory_status = inventory_status.iloc[0].to_dict()
-        
-        # Calculate metrics
-        waste_percentage = self.calculate_waste_percentage(sku_id, warehouse_id)
-        shelf_life_utilization = self.calculate_shelf_life_utilization(sku_id, warehouse_id)
-        
-        metrics = {
-            "waste_percentage": f"{waste_percentage:.2f}%",
-            "shelf_life_utilization": f"{shelf_life_utilization:.2f}",
-            "days_to_expiry": inventory_status['days_remaining']
-        }
-        
-        # Generate alerts
-        critical_inventory = self.identify_critical_inventory()
-        relevant_alerts = critical_inventory[
-            (critical_inventory['SKU_ID'] == sku_id) & 
-            (critical_inventory['warehous_id'] == warehouse_id)
-        ]
-        
-        alerts = []
-        if not relevant_alerts.empty:
-            alerts = relevant_alerts.iloc[0]['reasons']
-        
-        # Get analysis from LLM
-        analysis = self.analysis_chain.run(
-            product_info=str(product_info),
-            inventory_status=str(inventory_status),
-            metrics=str(metrics),
-            alerts=str(alerts)
-        )
-        
-        return analysis
+            # Get product data
+            product_info = self.product_data[self.product_data['SKU_ID'] == sku_id]
+            if product_info.empty:
+                return f"No product information found for SKU {sku_id}."
+            
+            # Get inventory data
+            inventory_data = self.time_series_data[
+                (self.time_series_data['SKU_id'] == sku_id) & 
+                (self.time_series_data['warehous_id'] == warehouse_id)
+            ]
+            if inventory_data.empty:
+                return f"No inventory data found for SKU {sku_id} in warehouse {warehouse_id}."
+            
+            # Calculate additional metrics
+            waste_percentage = self.calculate_waste_percentage(sku_id, warehouse_id)
+            shelf_life_utilization = self.calculate_shelf_life_utilization(sku_id, warehouse_id)
+            
+            # Add calculated metrics to inventory data
+            inventory_data_with_metrics = inventory_data.copy()
+            inventory_data_with_metrics['waste_percentage'] = waste_percentage
+            inventory_data_with_metrics['shelf_life_utilization'] = shelf_life_utilization * 100  # Convert to percentage
+            
+            # Run analysis
+            result = self.analysis_chain.run(
+                sku_id=sku_id,
+                warehouse_id=warehouse_id,
+                inventory_data=inventory_data_with_metrics.to_string(),
+                product_data=product_info.to_string()
+            )
+            
+            return result
+        except Exception as e:
+            return f"Error generating inventory analysis: {e}"
