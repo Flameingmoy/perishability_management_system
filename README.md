@@ -1,0 +1,2 @@
+Perishability management system : an agentic workflow that run inventory, environment and demand forecast analysis of a supply chain . This application can be useful for managing a supply chain which has a lot of volatile/perishable products.
+Tech Stack: Langchain for calling agents and connecting them to the data, Ollama for the llm and embeddings , specifically using granite3.3:8b for the llm and snowflake-arctic embbedings v2 for the embeddings, streamlit for the front end ui and plotly for dashboard creation.
