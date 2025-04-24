@@ -101,3 +101,43 @@ flowchart TD
     classDef external fill:#E8D0FF,stroke:#6a1a9a,color:#6a1a9a;
     classDef user fill:#FFFFFF,stroke:#000000,color:#000000,stroke-dasharray: 5 5;
 ```mermaid
+```mermaid
+flowchart TD
+    input[HSI Patch\n3D Tensor\n(63 bands × patch_size × patch_size)]
+    
+    %% CNN Feature Extractor
+    input --> conv1[Conv2D\n63→64 channels\n3×3 kernel]
+    conv1 --> conv2[Conv2D\n64→128 channels\n3×3 kernel]
+    conv2 --> conv3[Conv2D\n128→embed_dim channels\n3×3 kernel]
+    conv3 --> pool[Global Average Pooling]
+    pool --> flatten[Flatten to 1D]
+    
+    %% Transformer
+    flatten --> add_seq[Add Sequence Dimension]
+    add_seq --> tr_block[Transformer Blocks]
+    
+    %% Transformer Block Details
+    tr_block --> |"× N layers"| norm1[Layer Normalization]
+    norm1 --> mha[Multi-Head Attention]
+    mha --> add1[Add & Normalize]
+    add1 --> norm2[Layer Normalization]
+    norm2 --> mlp[MLP\nembed_dim → mlp_dim → embed_dim]
+    mlp --> add2[Add & Normalize]
+    
+    %% Final Processing
+    add2 --> final_norm[Layer Normalization]
+    final_norm --> global_pool[Global Average Pooling]
+    
+    %% Classification Head
+    global_pool --> fc[Fully Connected\nembed_dim → num_classes]
+    fc --> output[Output\nClass Probabilities]
+    
+    %% Styling
+    classDef cnn fill:#c6e5ff,stroke:#333
+    classDef transformer fill:#ffe6cc,stroke:#333
+    classDef general fill:#f9f9f9,stroke:#333
+    
+    class conv1,conv2,conv3,pool,flatten cnn
+    class add_seq,norm1,mha,add1,norm2,mlp,add2,final_norm,global_pool,tr_block transformer
+    class input,fc,output general
+```mermaid
